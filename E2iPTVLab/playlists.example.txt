@@ -1,0 +1,17 @@
+# E2iPTV playlist
+#
+# One provider per line. Put your provider's name after a # at the end
+# of the line; it's what the plugin shows. Lines starting with # are
+# ignored, so these examples do nothing until you add your own.
+#
+# Xtream Codes provider (username / password):
+#   http://example-provider.com:8080/get.php?username=YOURUSER&password=YOURPASS&type=m3u_plus #My Xtream
+#
+# Stalker / Ministra portal (MAC address):
+#   http://example-portal.com/c/?mac=00:1A:79:00:00:00 #My Stalker
+#
+# To switch a provider off without deleting it, put # straight in front
+# of http, like this:
+#   #http://example-provider.com:8080/get.php?username=YOURUSER&password=YOURPASS #Switched off
+#
+# After editing this file, restart the GUI (or reopen the plugin).
