@@ -201,6 +201,7 @@ from Screens.Screen import Screen
 from Components.ActionMap import ActionMap
 from Components.Label import Label
 from Components.MultiContent import MultiContentEntryText
+from .compat import MultiContentEntryText  # square rows where the image has no rounded ones
 from Components.GUIComponent import GUIComponent
 from enigma import (
     eTimer, eListbox, eListboxPythonMultiContent,

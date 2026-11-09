@@ -16,6 +16,7 @@ from Components.Label import Label
 from Components.Pixmap import Pixmap
 from Components.GUIComponent import GUIComponent
 from Components.MultiContent import MultiContentEntryText, MultiContentEntryPixmapAlphaBlend
+from .compat import MultiContentEntryText  # square rows where the image has no rounded ones
 from Tools.LoadPixmap import LoadPixmap
 from enigma import eTimer, eListbox, eListboxPythonMultiContent, gFont, RT_HALIGN_LEFT, RT_HALIGN_CENTER, RT_VALIGN_CENTER, gRGB, eServiceReference, ePoint, eSize
 

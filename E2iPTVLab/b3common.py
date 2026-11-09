@@ -21,6 +21,7 @@ from Components.MultiContent import (
     MultiContentEntryText,
     MultiContentEntryPixmapAlphaBlend,
 )
+from .compat import MultiContentEntryText  # square rows where the image has no rounded ones
 from enigma import RT_HALIGN_LEFT, RT_VALIGN_CENTER
 
 try:

@@ -350,6 +350,38 @@ def _next_run_text():
     return "%02d:00 %s" % (hour, day)
 
 
+def _playlist_names():
+    """Names of the providers in the current playlist (switched off ones
+    too), or None if it can't be read."""
+    import json
+    path = "/etc/enigma2/E2iPTVLab/playlists.txt"
+    try:
+        with open(DATA + "/cache/app_settings.json") as f:
+            path = json.load(f).get("playlists_path") or path
+    except Exception:
+        pass
+    # The same rules as backend/playlist_reader.py: provider lines start
+    # with http (or #http when switched off); the name follows a '#';
+    # without one the reader numbers them "Provider 001" ...
+    import re
+    names = set()
+    try:
+        n = 0
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if line.startswith("#http"):
+                    line = line[1:]
+                elif not line.startswith("http"):
+                    continue
+                n += 1
+                m = re.search(r"#(.+)$", line)
+                names.add(m.group(1).strip() if m else "Provider %03d" % n)
+    except Exception:
+        return None
+    return names
+
+
 def summary_lines():
     import json
     path = DATA + "/epg/last_summary.json"
@@ -403,6 +435,11 @@ def summary_lines():
     except Exception:
         fill, fill_when, fill_count = {}, None, 0
     provs = data.get("providers") or {}
+    names = _playlist_names()
+    if names:
+        # Providers taken out of the playlist keep their old entry in
+        # the summary file - leave them out here.
+        provs = {n: p for n, p in provs.items() if n in names}
     if not provs:
         out.append("No provider results yet.")
     order = {"FAILED": 0, "PARTIAL": 1, "SKIPPED": 2, "OK": 3}

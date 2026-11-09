@@ -24,6 +24,7 @@ from Components.MultiContent import (
     MultiContentEntryText,
     MultiContentEntryPixmapAlphaBlend
 )
+from .compat import MultiContentEntryText  # square rows where the image has no rounded ones
 from Tools.LoadPixmap import LoadPixmap
 import threading
 import os

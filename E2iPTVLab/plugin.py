@@ -111,12 +111,27 @@ class EpgScheduler(object):
                     + env.get("PYTHONPATH", "")
                 )
 
+                # The playlist chosen in Settings -> Other -> Playlists,
+                # read from the settings here: state.playlists_path is
+                # only filled in once the plugin has been opened, and the
+                # box may not have opened it since a restart.
+                playlists = state.playlists_path
+                try:
+                    import json
+                    with open(DATA + "/cache/app_settings.json") as f:
+                        chosen = json.load(f).get("playlists_path")
+                    if chosen:
+                        playlists = chosen
+                except Exception:
+                    pass
+                log.write("Playlist: %s\n" % playlists)
+
                 process = subprocess.Popen(
                     [
                         "python3",
                         EPG_SCRIPT,
                         "--playlists",
-                        state.playlists_path
+                        playlists
                     ],
                     stdout=log,
                     stderr=subprocess.STDOUT,

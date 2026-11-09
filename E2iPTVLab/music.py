@@ -41,6 +41,7 @@ from Components.ActionMap import ActionMap
 from Components.Label import Label
 from Components.Pixmap import Pixmap
 from Components.MultiContent import MultiContentEntryText
+from .compat import MultiContentEntryText  # square rows where the image has no rounded ones
 from Components.GUIComponent import GUIComponent
 from Tools.LoadPixmap import LoadPixmap
 from enigma import (
@@ -51,6 +52,9 @@ from enigma import (
 
 from .paths import DATA, LOG
 from .b1common import B1_ICON_PATH
+from . import music_index as _mi
+from . import music_playlists as _pls
+from . import music_tracker as _trk
 
 DEFAULT_ROOT = ""                   # none: chosen in Settings -> Playback
 SETTINGS_PATH = os.path.join(DATA, "cache", "music.json")
@@ -59,7 +63,7 @@ FFMPEG = "/usr/bin/ffmpeg"
 
 AUDIO_EXT = (".mp3", ".flac", ".m4a", ".aac", ".ogg", ".oga", ".opus",
              ".wav", ".wma", ".ape", ".wv", ".aiff", ".aif", ".alac",
-             ".mka", ".mp2", ".ac3", ".dsf", ".dff")
+             ".mka", ".mp2", ".ac3", ".dsf", ".dff", ".mp4", ".m4r") + _trk.TRACKER_EXT
 COVER_NAMES = ("folder", "cover", "front", "albumart", "album", "albumartlarge")
 IMAGE_EXT = (".jpg", ".jpeg", ".png")
 MAX_TRACKS = 10000         # Play all / Shuffle on a whole genre: plenty
@@ -71,6 +75,7 @@ KEY_NEXT = 163
 KEY_PREV = 165
 KEY_FF = 208
 KEY_REW = 168
+KEY_MENU = 139
 
 
 def _log(msg):
@@ -103,6 +108,9 @@ def _save_settings(**kw):
         os.replace(tmp, SETTINGS_PATH)
     except Exception as e:
         _log("settings save: %s" % e)
+
+
+DELETED_DIR = "Deleted"     # Menu -> Delete this track moves files here
 
 
 def music_root():
@@ -140,6 +148,15 @@ def is_audio(name):
     return name.lower().endswith(AUDIO_EXT)
 
 
+def is_music_file(full, name):
+    """is_audio, plus tracker files known only by what's in them (inside
+    the Tracker Files folder: S3M files without '.s3m' and the like)."""
+    if is_audio(name):
+        return True
+    return _trk.in_tracker_folder(full) and _trk.maybe_tracker(name) \
+        and bool(_trk.sniff(full))
+
+
 def list_folder(path):
     """(folders, tracks) in a folder, each a sorted list of (name, path).
     Hidden files (Mac "._" files etc.) are left out."""
@@ -150,8 +167,10 @@ def list_folder(path):
         full = os.path.join(path, name)
         try:
             if os.path.isdir(full):
+                if name == DELETED_DIR and path.rstrip("/") == music_root():
+                    continue           # the bin (Delete this track)
                 folders.append((name, full))
-            elif is_audio(name):
+            elif is_music_file(full, name):
                 tracks.append((name, full))
         except Exception:
             pass
@@ -167,16 +186,36 @@ def gather_tracks(path, limit=MAX_TRACKS):
         dirnames[:] = sorted((d for d in dirnames if not d.startswith(".")),
                              key=_natural_key)
         for name in sorted(filenames, key=_natural_key):
-            if not name.startswith(".") and is_audio(name):
+            if not name.startswith(".") and \
+                    is_music_file(os.path.join(dirpath, name), name):
                 out.append(os.path.join(dirpath, name))
                 if len(out) >= limit:
                     return out
     return out
 
 
+def list_name(name, path):
+    """(name, type) for the file list: 'mod.axelf' -> ('axelf', '.mod')
+    like 'axelf.mod'; a tracker file with no extension shows the type
+    found inside it ('SATELL' -> ('SATELL', '.s3m'))."""
+    m = re.match(r"(?i)^(mod|s3m|xm|it|med|okt|stm|mtm|669|ptm|ult|far)\.(.+)$", name)
+    if m and not name.lower().endswith(AUDIO_EXT):
+        return m.group(2), "." + m.group(1).lower()
+    base, ext = os.path.splitext(name)
+    if not ext and _trk.in_tracker_folder(path):
+        kind = _trk.sniff(path)
+        if kind:
+            return name, "." + kind
+    return base, ext
+
+
 def track_name(path):
     """File name without the extension or a leading track number."""
-    name = os.path.splitext(os.path.basename(path))[0]
+    base = os.path.basename(path)
+    m = re.match(r"(?i)^(mod|s3m|xm|it|med|okt|stm|mtm|669|ptm|ult|far)\.(.+)$", base)
+    if m and not base.lower().endswith(AUDIO_EXT):
+        return m.group(2)               # Amiga style: mod.tune name
+    name = os.path.splitext(base)[0]
     return re.sub(r"^\s*\d{1,3}\s*[-._)]?\s+", "", name) or name
 
 
@@ -213,6 +252,10 @@ def read_tags(path):
     'length' (seconds)}. Cached; {} if ffmpeg can't read the file."""
     if path in _tag_cache:
         return _tag_cache[path]
+    if _trk.is_tracker(path):
+        tags = _trk.info(path)
+        _tag_cache[path] = tags
+        return tags
     tags = {}
     try:
         p = subprocess.run([FFMPEG, "-hide_banner", "-nostdin", "-i", path,
@@ -788,6 +831,10 @@ class _Queue(object):
         self._started_at = 0.0
         self.levels = None         # Levels for the current track
         self.spectrum = None       # Spectrum for the current track
+        self.preparing = None      # tracker file being turned into sound
+        self._play_path = None     # what the box is actually playing
+        self._prep_result = None
+        self._prep_timer = None
 
     # -- starting / stopping ------------------------------------------------
 
@@ -818,20 +865,83 @@ class _Queue(object):
         if not path:
             return
         self.paused = False
-        ref = eServiceReference(4097, 0, path)
-        ref.setName(track_name(path))
+        self.preparing = None
+        if _trk.is_tracker(path):
+            wav = _trk.cached(path)
+            if wav is None:
+                self._prepare(path)
+                return
+            self._play_file(path, wav)
+        else:
+            self._play_file(path, path)
+
+    def _play_file(self, path, play):
+        """Play `play` for the track `path` (the same file, or the .wav
+        made from a tracker file)."""
+        ref = eServiceReference(4097, 0, play)
+        name = _tag_cache.get(path, {}).get("title") or track_name(path)
+        if _trk.is_tracker(path):
+            name = " ".join(name.replace("_", " ").split()) or name
+        ref.setName(name)
         _log("play %d/%d: %s" % (self.index + 1, len(self.tracks),
                                  os.path.basename(path)))
+        self._play_path = play
         self._started_at = time.time()
         self._stop_readers()
         play_pos[0] = 0.0
-        self.levels = Levels(path)
-        self.spectrum = Spectrum(path)
+        self.levels = Levels(play)
+        self.spectrum = Spectrum(play)
         try:
             self.session.nav.playService(ref)
         except Exception as e:
             _log("play failed: %s" % e)
         self.changed += 1
+        self._prefetch()
+
+    # Tracker files: made into sound first (in the background)
+    def _prepare(self, path):
+        try:
+            if self._is_ours():
+                self.session.nav.stopService()   # quiet while it's made
+        except Exception:
+            pass
+        self._stop_readers()
+        self.preparing = path
+        self._prep_result = None
+        self.changed += 1
+        _log("preparing %s" % os.path.basename(path))
+
+        def work():
+            self._prep_result = (path, _trk.render(path))
+        threading.Thread(target=work, name="E2iPTV-Tracker", daemon=True).start()
+        if self._prep_timer is None:
+            self._prep_timer = eTimer()
+            self._prep_timer.callback.append(self._prep_poll)
+        self._prep_timer.start(250, False)
+
+    def _prep_poll(self):
+        res = self._prep_result
+        if res is None:
+            return
+        self._prep_timer.stop()
+        self._prep_result = None
+        path, wav = res
+        if not self.active or self.preparing != path or self.current() != path:
+            return                      # moved on meanwhile (it stays cached)
+        self.preparing = None
+        if wav:
+            self._play_file(path, wav)
+        else:
+            _log("can't play %s - skipped" % os.path.basename(path))
+            self.changed += 1
+            self.next()
+
+    def _prefetch(self):
+        """Get the next tune ready while this one plays."""
+        nxt = self.upcoming()
+        if nxt and _trk.is_tracker(nxt) and _trk.cached(nxt) is None:
+            threading.Thread(target=_trk.render, args=(nxt,),
+                             name="E2iPTV-Tracker-Next", daemon=True).start()
 
     def stop(self):
         """Stop the music (stay silent)."""
@@ -839,6 +949,7 @@ class _Queue(object):
             _log("stop")
         self.active = False
         self.paused = False
+        self.preparing = None
         self._stop_readers()
         try:
             if self._is_ours():
@@ -906,8 +1017,8 @@ class _Queue(object):
         past what the meters have read (or back before where they
         started), start them again from here rather than have them race
         through everything in between - that load slowed the sound."""
-        path = self.current()
-        if not path or not self.active:
+        path = self._play_path
+        if not path or not self.active or self.preparing:
             return
         lv, sp = self.levels, self.spectrum
         if lv is not None and sp is not None and lv.covers(pos) and sp.covers(pos):
@@ -1018,13 +1129,15 @@ class _Queue(object):
         try:
             cur = self.session.nav.getCurrentlyPlayingServiceReference()
             return cur is not None and cur.type == 4097 \
-                and cur.getPath() == self.current()
+                and cur.getPath() == self._play_path
         except Exception:
             return False
 
     def _event(self, evt):
         if not self.active:
             return
+        if self.preparing:
+            return                      # nothing of ours playing just now
         if evt == iPlayableService.evEOF and self._is_ours():
             _log("end of track")
             self.next()
@@ -1069,6 +1182,12 @@ class _MediaKeys(object):
                 return 0
         except Exception:
             return 0
+        if key == KEY_MENU:
+            if not hasattr(self, "_item_menu"):
+                return 0
+            from twisted.internet import reactor
+            reactor.callLater(0, self._item_menu)
+            return 1
         if key == KEY_STOP:
             queue.stop()
         elif key in KEY_PLAYPAUSE:
@@ -1223,12 +1342,12 @@ _P_PANEL, _P_SEL, _P_TEXT, _P_DIM, _P_ACCENT = (
 _L_X, _L_W = 40, 600
 _R_X, _R_W = 670, 1210
 _P_Y, _P_H = 100, 940
-_PL_ROW_H, _PL_ROWS = 62, 5
+_PL_ROW_H, _PL_ROWS = 44, 10
 _PL_Y = _P_Y + 16
 _F_ROW_H, _F_ROWS = 66, 13
 _F_Y = _P_Y + 16
 _INFO_Y = _PL_Y + _PL_ROWS * _PL_ROW_H + 30
-_THUMB = 240
+_THUMB = 190
 
 
 def _row(w, h, cells, sel):
@@ -1251,6 +1370,10 @@ def _row(w, h, cells, sel):
             flags=align | RT_VALIGN_CENTER,
             color=col, color_sel=col, backcolor=bg, backcolor_sel=bg))
     return out
+
+
+_SEARCH_CRIT = {"any": "", "artist": [], "genre": [], "y1": "", "y2": "",
+                "album": "", "track": ""}
 
 
 class MusicBrowser(_MediaKeys, Screen):
@@ -1285,6 +1408,30 @@ class MusicBrowser(_MediaKeys, Screen):
         self._info_key = None      # what the info panel is showing / loading
         self._info_job = None
         self._info_due = 0
+        # Browsing by Artist / Genre / Year / Album, from the music index
+        st = _settings()
+        self._mode = st.get("browse") if st.get("browse") in _mi.MODE_NAMES else "folders"
+        self._sort = st.get("sort") if st.get("sort") in _mi.SORT_NAMES else "az"
+        self._layout = st.get("layout") if st.get("layout") in _mi.LAYOUT_NAMES \
+            else _mi.DEFAULT_LAYOUT
+        self._lib = None           # music_index.Library once loaded
+        self._vpath = []           # [(field, key)] chosen so far
+        self._vstack = []          # the highlight to go back to, per level
+        self._album_path = None    # album folder opened from the index
+        self._album_back = 0
+        self._item_notes = []      # right-hand note per row (index lists)
+        self._seen_index = _mi.indexer.done_count
+        # Search: the criteria (kept while the box is on), the results
+        # being shown (None when not searching) and where to go back to
+        self._crit = dict(_SEARCH_CRIT)
+        self._search = None
+        self._s_back = None
+        self._s_menu_pos = 0
+        # Playlists view: {"open": name or None, "back": where to return,
+        # "sel": highlight on the list of playlists}; None when not shown
+        self._plv = None
+        self._pl_target = None
+        self._tracker_dir = self._find_tracker_dir()
 
         self.skin = """
 <screen name="E2iLabMusic" position="0,0" size="1920,1080" flags="wfNoBorder" backgroundColor="{bg}">
@@ -1341,6 +1488,7 @@ class MusicBrowser(_MediaKeys, Screen):
                 "green":  lambda: self._play_all(False),
                 "yellow": lambda: self._play_all(True),
                 "blue":   self._open_player,
+                "red":    self._search_open,
             }, -1)
         # CH+ / CH-: a page at a time
         self["pages"] = ActionMap(["ChannelSelectBaseActions"], {
@@ -1369,7 +1517,13 @@ class MusicBrowser(_MediaKeys, Screen):
             self._say("No music folder chosen yet - set it in Settings -> Playback -> Music folder")
             self._paint()
             return
-        self._load(self._path)
+        if self._mode != "folders":
+            self._index_open()
+        else:
+            pl = _settings().get("place") or {}
+            item = pl.get("item") if pl.get("mode") == "folders" \
+                and pl.get("path") == self._path else None
+            self._load(self._path, select=item)
 
     def _load(self, path, select=None):
         if self._busy:
@@ -1407,6 +1561,7 @@ class MusicBrowser(_MediaKeys, Screen):
         if self._info_due and time.time() >= self._info_due:
             self._info_due = 0
             self._info_start()
+        self._index_tick()
         if queue.changed != self._seen_change:
             self._seen_change = queue.changed
             self._places_build()
@@ -1445,6 +1600,7 @@ class MusicBrowser(_MediaKeys, Screen):
             items += [(n, p, True) for n, p in folders] + \
                      [(n, p, False) for n, p in tracks]
             self._items = items
+            self._item_notes = []
             sel = 1 if (items and items[0][2] == "up" and len(items) > 1) else 0
             if self._want_sel:
                 sel = next((i for i, it in enumerate(items)
@@ -1455,6 +1611,18 @@ class MusicBrowser(_MediaKeys, Screen):
             self._paint()
             if not folders and not tracks:
                 self._say("This folder is empty")
+        elif kind == "index":
+            self._busy = False
+            self._index_loaded(job[1])
+        elif kind == "sindex":
+            self._busy = False
+            self._search_index_loaded(job[1])
+        elif kind == "search":
+            self._busy = False
+            self._search_done(job[1], job[2])
+        elif kind == "pladd":
+            self._busy = False
+            self._pl_added(job[1], job[2])
         elif kind == "gather":
             _k, tracks, shuffle, label = job
             self._busy = False
@@ -1474,10 +1642,18 @@ class MusicBrowser(_MediaKeys, Screen):
         places = []
         if queue.active or queue.current():
             places.append(("now", "Now Playing"))
-        places.append(("play", "Play this folder"))
-        places.append(("shuffle", "Shuffle this folder"))
+        what = "list" if self._virtual() else "folder"
+        places.append(("play", "Play this " + what))
+        places.append(("shuffle", "Shuffle this " + what))
         if queue.active:
             places.append(("stop", "Stop music"))
+        if self._tracker_dir:
+            places.append(("tracker", "Tracker Files"))
+        places.append(("search", "Search"))
+        places.append(("playlists", "Playlists"))
+        if self._mode != "folders":
+            places.append(("browse", "Browse: " + _mi.MODE_NAMES.get(self._mode, "")))
+        places.append(("library", "Browse, sort and rescan"))
         places.append(("root", "Music folder"))
         keep = self._places[self._pl_sel][0] if self._places else None
         self._places = places
@@ -1508,16 +1684,26 @@ class MusicBrowser(_MediaKeys, Screen):
         for i in range(self._scroll, min(n, self._scroll + _F_ROWS)):
             name, path, is_dir = self._items[i]
             sel = self._focus == "files" and i == self._sel
+            note = self._item_notes[i] if i < len(self._item_notes) else ""
             if is_dir == "up":
                 cells = [(24, w - 48, 0, "..", _P_ACCENT, RT_HALIGN_LEFT)]
+            elif is_dir in ("group", "album", "plist"):
+                nw = 440 if is_dir == "album" else 300
+                cells = [(24, w - 72 - nw, 0, "\u25b8  " + name, _P_TEXT, RT_HALIGN_LEFT),
+                         (w - 24 - nw, nw, 1, note, _P_DIM, RT_HALIGN_RIGHT)]
             elif is_dir:
                 cells = [(24, w - 48, 0, "▸  " + name, _P_TEXT, RT_HALIGN_LEFT)]
             else:
-                base, ext = os.path.splitext(name)
+                base, ext = list_name(name, path)
                 playing = path == cur
-                cells = [(24, w - 48 - 160, 0, ("♫  " if playing else "") + base,
-                          _P_ACCENT if playing else _P_TEXT, RT_HALIGN_LEFT),
-                         (w - 24 - 140, 140, 1, ext[1:].upper(), _P_DIM, RT_HALIGN_RIGHT)]
+                if note:
+                    cells = [(24, w - 72 - 440, 0, ("♫  " if playing else "") + name,
+                              _P_ACCENT if playing else _P_TEXT, RT_HALIGN_LEFT),
+                             (w - 24 - 440, 440, 1, note, _P_DIM, RT_HALIGN_RIGHT)]
+                else:
+                    cells = [(24, w - 48 - 160, 0, ("♫  " if playing else "") + base,
+                              _P_ACCENT if playing else _P_TEXT, RT_HALIGN_LEFT),
+                             (w - 24 - 140, 140, 1, ext[1:].upper(), _P_DIM, RT_HALIGN_RIGHT)]
             rows.append(_row(w, _F_ROW_H, cells, sel))
         self["list"].setList(rows)
         self._paint_places()
@@ -1549,7 +1735,15 @@ class MusicBrowser(_MediaKeys, Screen):
             self._say("No music folder chosen yet - set it in Settings -> Playback -> Music folder")
             return
         self._notice = ""
-        self._load(root)
+        self._lib = None
+        self._search, self._s_back = None, None
+        self._plv = None
+        self._tracker_dir = self._find_tracker_dir()
+        self._vpath, self._vstack, self._album_path = [], [], None
+        if self._mode != "folders":
+            self._index_open()
+        else:
+            self._load(root)
 
     def _show_status(self):
         if self._busy:
@@ -1557,6 +1751,10 @@ class MusicBrowser(_MediaKeys, Screen):
         cur = queue.current() if queue.active else None
         if not cur:
             self["status"].setText(self._notice)
+            return
+        if queue.preparing:
+            self["status"].setText("Preparing:  %s ..." % (
+                _tag_cache.get(cur, {}).get("title") or track_name(cur)))
             return
         pos, length = queue.position()
         tags = _tag_cache.get(cur, {})
@@ -1577,6 +1775,8 @@ class MusicBrowser(_MediaKeys, Screen):
             if key == "now" and cur:
                 return ("track", cur)
             if key in ("play", "shuffle"):
+                if self._virtual():
+                    return ("list", key)
                 return ("folder", self._path)
             if key == "root":
                 return ("folder", self._root)
@@ -1586,6 +1786,8 @@ class MusicBrowser(_MediaKeys, Screen):
         name, path, is_dir = self._items[self._sel]
         if is_dir == "up":
             return ("folder", path)
+        if is_dir in ("group", "plist"):
+            return ("group", (self._sel, path))
         return ("folder" if is_dir else "track", path)
 
     def _info_soon(self):
@@ -1606,6 +1808,12 @@ class MusicBrowser(_MediaKeys, Screen):
                             tags.get("album") or album, "")
         elif kind == "folder" and path:
             self._info_text(os.path.basename(path.rstrip("/")) or "Music", "", "", "")
+        elif kind == "group":
+            i = path[0]
+            self._info_text(self._items[i][0], "", "",
+                            self._item_notes[i] if i < len(self._item_notes) else "")
+        elif kind == "list":
+            self._info_text(self._v_title(), "", "", self._v_count_text())
         else:
             self._info_text(self._places_help(path), "", "", "")
         if kind in ("track", "folder") and path:
@@ -1615,10 +1823,20 @@ class MusicBrowser(_MediaKeys, Screen):
         self._info_key = None
         self._info_soon()
 
-    @staticmethod
-    def _places_help(key):
+    def _places_help(self, key):
         return {"stop": "Stop the music",
-                "now": "Open Now Playing"}.get(key, "")
+                "now": "Open Now Playing",
+                "library": "Browse by Artist, Genre, Year or Album, "
+                           "sort the albums, or rescan the music",
+                "search": "Find music by artist, genre, year, album "
+                          "or track name  (Red)",
+                "playlists": "Your own playlists. Menu on a track, album, "
+                             "artist or list adds it to one",
+                "browse": "The top of your music by %s - change it in "
+                          "Browse, sort and rescan" % _mi.MODE_NAMES.get(self._mode, ""),
+                "root": "Your music folder, A-Z as on disk",
+                "tracker": "Your tracker music: MOD, S3M, XM, IT ... "
+                           "Made ready to play when you play it"}.get(key, "")
 
     def _info_text(self, title, artist, album, detail):
         for n, v in (("i_title", title), ("i_artist", artist),
@@ -1627,7 +1845,7 @@ class MusicBrowser(_MediaKeys, Screen):
 
     def _info_start(self):
         target = self._info_key
-        if not target:
+        if not target or target[0] not in ("track", "folder") or not target[1]:
             return
         kind, path = target
 
@@ -1694,15 +1912,29 @@ class MusicBrowser(_MediaKeys, Screen):
     def _page(self):
         return _PL_ROWS if self._focus == "places" else _F_ROWS
 
+    @staticmethod
+    def _step(cur, d, n):
+        """Down on the last entry goes to the first, Up on the first to
+        the last. A page (CH+/CH-) stops at the end first, and wraps
+        round on the next press."""
+        if n <= 0:
+            return 0
+        new = cur + d
+        if new >= n:
+            return 0 if cur == n - 1 else n - 1
+        if new < 0:
+            return n - 1 if cur == 0 else 0
+        return new
+
     def _move(self, d):
         if self._focus == "places":
             if self._places:
-                self._pl_sel = max(0, min(len(self._places) - 1, self._pl_sel + d))
+                self._pl_sel = self._step(self._pl_sel, d, len(self._places))
                 self._paint_places()
                 self._info_soon()
             return
         if self._items:
-            self._sel = max(0, min(len(self._items) - 1, self._sel + d))
+            self._sel = self._step(self._sel, d, len(self._items))
             self._paint()
 
     def _on_ok(self):
@@ -1712,6 +1944,17 @@ class MusicBrowser(_MediaKeys, Screen):
         if self._busy or not self._items:
             return
         name, path, is_dir = self._items[self._sel]
+        if is_dir == "plist":
+            self._plv["sel"] = self._sel
+            self._plv["open"] = path
+            self._plv_show(None)
+            return
+        if is_dir == "group":
+            self._v_enter(path)
+            return
+        if is_dir == "album":
+            self._album_open(path)
+            return
         if is_dir == "up":
             self._up_folder()
             return
@@ -1729,18 +1972,67 @@ class MusicBrowser(_MediaKeys, Screen):
         if key == "now":
             self._open_player()
         elif key in ("play", "shuffle"):
-            self._play_folder(self._path, key == "shuffle")
+            if self._virtual():
+                self._v_play(None, key == "shuffle")
+            else:
+                self._play_folder(self._path, key == "shuffle")
+        elif key == "library":
+            self._library_menu()
+        elif key == "search":
+            self._search_open()
+        elif key == "playlists":
+            self._focus = "files"
+            self._plv_open()
+        elif key == "tracker" and self._tracker_dir:
+            self._focus = "files"
+            self._search, self._s_back = None, None
+            self._plv = None
+            if self._mode != "folders" and self._lib is not None:
+                self._album_open(self._tracker_dir)    # Exit comes back here
+            else:
+                self._load(self._tracker_dir)
         elif key == "stop":
             queue.stop()
             self._places_build()
             self._paint()
             self._show_status()
         elif key == "root" and self._root:
+            # Always the music folder itself, A-Z as on disk (Exit goes back
+            # to the Browse by list when one is in use)
             self._focus = "files"
-            self._load(self._root)
+            self._search, self._s_back = None, None
+            self._plv = None
+            if self._mode != "folders" and self._lib is not None:
+                if self._album_path is not None:
+                    self._album_path = None
+                    self._v_top()
+                self._album_open(self._root)
+            else:
+                self._load(self._root)
+        elif key == "browse":
+            # The top of the Browse by list (Genres, Artists, Years ...)
+            self._focus = "files"
+            self._search, self._s_back = None, None
+            self._plv = None
+            if self._lib is not None:
+                self._v_top()
+            else:
+                self._index_open()
 
     def _play_all(self, shuffle):
         """Green / Yellow: the highlighted folder, or this folder."""
+        if self._items and self._items[self._sel][2] == "plist":
+            self._pl_play(self._items[self._sel][1], shuffle)
+            return
+        if self._items and self._items[self._sel][2] == "group":
+            self._v_play(self._items[self._sel][1], shuffle)
+            return
+        if self._items and self._items[self._sel][2] == "album":
+            self._play_folder(self._items[self._sel][1], shuffle)
+            return
+        if self._virtual():
+            self._v_play(None, shuffle)
+            return
         if self._items and self._items[self._sel][2] is True:
             self._play_folder(self._items[self._sel][1], shuffle)
         else:
@@ -1765,6 +2057,39 @@ class MusicBrowser(_MediaKeys, Screen):
     def _up_folder(self):
         if self._busy:
             return False
+        if self._plv is not None:
+            self._plv_up()
+            return True
+        if self._search is not None:
+            if self._album_path is not None:
+                if self._path == self._album_path or \
+                        not self._path.startswith(self._album_path + "/"):
+                    self._album_path = None
+                    self._s_show(self._album_back)
+                    return True
+            else:
+                self._search_leave()
+                return True
+        elif self._mode != "folders" and self._lib is not None:
+            if self._album_path is not None:
+                if self._path == self._album_path or \
+                        not self._path.startswith(self._album_path + "/"):
+                    self._album_path = None
+                    self._v_show(self._album_back)
+                    return True
+            elif self._vpath:
+                _f, key = self._vpath.pop()
+                sel = self._vstack.pop() if self._vstack else None
+                self._v_show(sel)
+                if sel is None:             # (reopened here) the one we came from
+                    for i, it in enumerate(self._items):
+                        if it[1] == key:
+                            self._sel = i
+                            self._paint()
+                            break
+                return True
+            else:
+                return False
         if self._path == self._root or not self._path.startswith(self._root):
             return False
         self._load(os.path.dirname(self._path), select=os.path.basename(self._path))
@@ -1811,6 +2136,995 @@ class MusicBrowser(_MediaKeys, Screen):
     def _media_changed(self):
         self._show_status()
 
+    # -- browsing from the music index ---------------------------------------
+
+    def _find_tracker_dir(self):
+        """<music folder>/Tracker Files, if there is one."""
+        root = self._root or music_root()
+        if not root:
+            return None
+        p = os.path.join(root, "Tracker Files")
+        try:
+            return p if os.path.isdir(p) else None
+        except Exception:
+            return None
+
+    def _virtual(self):
+        """True while showing a list from the index or search results
+        (not a real folder)."""
+        return (self._mode != "folders" or self._search is not None
+                or self._plv is not None) and self._album_path is None
+
+    def _index_open(self):
+        if not self._root:
+            return
+        if self._lib is not None:
+            self._v_top()
+            self._index_check()
+            return
+        if self._busy:
+            return
+        self._busy = True
+        self["header"].setText("Music   (opening the music index...)")
+        root, layout = self._root, self._layout
+
+        def work():
+            try:
+                data = _mi.load_index(root, layout)
+            except Exception as e:
+                _log("index load: %s" % e)
+                data = None
+            self._job = ("index", data)
+        threading.Thread(target=work, name="E2iPTV-Music-IndexLoad", daemon=True).start()
+
+    def _index_loaded(self, data):
+        if self._mode == "folders":
+            return
+        if data is None:
+            self._lib = None
+            self._items, self._item_notes = [], []
+            self["header"].setText("Music")
+            self._paint()
+            if not _mi.indexer.busy:
+                _mi.indexer.start(self._root, self._layout)
+            self._say("Building the music index - the first time takes a while")
+            return
+        self._lib = _mi.Library(data)
+        if not self._restore_place():
+            self._v_top()
+        self._index_check()
+
+    def _restore_place(self):
+        """Open where Music was last time (see _remember_place)."""
+        pl = _settings().get("place") or {}
+        if pl.get("mode") != self._mode or self._lib is None:
+            return False
+        try:
+            vpath = [tuple(v) for v in pl.get("vpath") or []]
+            levels = self._levels()
+            if len(vpath) > len(levels) or \
+                    any(f != levels[i] for i, (f, _k) in enumerate(vpath)):
+                return False
+            if vpath and not self._lib.select(vpath):
+                return False                # gone since
+            self._vpath, self._vstack = vpath, [None] * len(vpath)
+            album, path, item = pl.get("album"), pl.get("path"), pl.get("item")
+            root = self._root.rstrip("/")
+            if album and path and (path == album or path.startswith(album + "/")) \
+                    and (album == root or album.startswith(root + "/")) \
+                    and os.path.isdir(path):
+                self._v_show(None)
+                self._album_back = self._sel
+                for i, it in enumerate(self._items):
+                    if it[1] == album:
+                        self._album_back = i
+                        break
+                self._album_path = album
+                self._places_build()
+                self._load(path, select=item)
+                return True
+            self._v_show(None)
+            for i, it in enumerate(self._items):
+                if it[0] == item:
+                    self._sel = i
+                    self._paint()
+                    break
+            return True
+        except Exception as e:
+            _log("restore place: %s" % e)
+            return False
+
+    def _index_check(self):
+        """A look for new or changed music, at most every 10 minutes."""
+        ix = _mi.indexer
+        if not ix.busy and time.time() - ix.last_check > 600:
+            ix.start(self._root, self._layout)
+
+    def _index_tick(self):
+        ix = _mi.indexer
+        if ix.done_count != self._seen_index:
+            self._seen_index = ix.done_count
+            data = ix.result
+            if ix.error:
+                self._say("Music index failed: %s" % ix.error)
+            elif data is not None and data.get("root") == self._root \
+                    and data.get("layout") == self._layout:
+                self._lib = _mi.Library(data)
+                self._notice = ""
+                if self._mode != "folders" and self._album_path is None \
+                        and self._search is None and self._plv is None:
+                    self._v_refresh()
+            self._show_status()
+        elif ix.busy:
+            self._notice = "%s the music index...  %d albums   %s" % (
+                "Building" if ix.kind == "build" else "Checking",
+                ix.albums_seen, ix.progress)
+            if not queue.active:
+                self["status"].setText(self._notice)
+
+    def _levels(self):
+        return _mi.MODE_LEVELS.get(self._mode, ())
+
+    def _v_title(self):
+        lib = self._lib
+        if self._plv is not None:
+            return self._plv["open"] or "Playlists"
+        if self._search is not None:
+            return "Search results"
+        if lib is None:
+            return "Music"
+        if self._vpath:
+            f, k = self._vpath[-1]
+            return lib.name(f, k)
+        return _mi.MODE_NAMES.get(self._mode, "Music")
+
+    def _v_count_text(self):
+        lib = self._lib
+        if self._plv is not None:
+            n = len(self._items)
+            what = "track" if self._plv["open"] else "playlist"
+            return "%d %s%s" % (n, what, "" if n == 1 else "s")
+        if self._search is not None:
+            return self._s_count_text()
+        if lib is None:
+            return ""
+        idx = lib.select(self._vpath)
+        n = len(idx)
+        t = sum(lib.albums[i][_mi.A_TRACKS] for i in idx)
+        return "%d album%s   \u00b7   %d track%s" % (
+            n, "" if n == 1 else "s", t, "" if t == 1 else "s")
+
+    def _v_show(self, sel=None):
+        lib = self._lib
+        if lib is None:
+            return
+        levels = self._levels()
+        depth = len(self._vpath)
+        idx = lib.select(self._vpath)
+        items, notes = [], []
+        if self._vpath:
+            items.append(("..", None, "up"))
+            notes.append("")
+        chosen = dict(self._vpath)
+        crumbs = ["Music"] + [lib.name(f, k) for f, k in self._vpath]
+        if depth < len(levels):
+            field = levels[depth]
+            crumbs.append(_mi.FIELD_NAMES.get(field, field))
+            for key, shown, n in lib.groups(idx, field, self._sort):
+                items.append((shown, key, "group"))
+                notes.append("%d album%s" % (n, "" if n == 1 else "s"))
+        else:
+            crumbs.append("Albums")
+            for i in lib.sorted_albums(idx, self._sort):
+                a = lib.albums[i]
+                bits = []
+                if "artist" not in chosen:
+                    bits.append(a[_mi.A_ARTIST])
+                if "year" not in chosen:
+                    bits.append(a[_mi.A_YEAR])
+                if "genre" not in chosen and a[_mi.A_GENRE]:
+                    bits.append(lib.name("genre", lib.keys[i]["genre"]))
+                items.append((a[_mi.A_ALBUM], os.path.join(self._root, a[_mi.A_REL]),
+                              "album"))
+                notes.append("  \u00b7  ".join(b for b in bits if b))
+        self._items, self._item_notes = items, notes
+        first = 1 if (items and items[0][2] == "up" and len(items) > 1) else 0
+        self._sel = sel if (sel is not None and 0 <= sel < len(items)) else first
+        self._scroll = 0
+        self["header"].setText("  \u203a  ".join(crumbs))
+        self._places_build()
+        self._paint()
+        if not lib.albums:
+            self._say("No albums found - check Browse, sort and rescan -> Folder layout")
+
+    def _v_refresh(self):
+        """The index has changed: redraw, keeping the highlight on the
+        same entry if it's still there."""
+        cur = self._items[self._sel][1] if self._items else None
+        # Drop choices that no longer exist
+        while self._vpath and not self._lib.select(self._vpath):
+            self._vpath.pop()
+            if self._vstack:
+                self._vstack.pop()
+        self._v_show(None)
+        for i, it in enumerate(self._items):
+            if it[1] == cur and cur is not None:
+                self._sel = i
+                self._paint()
+                break
+
+    def _v_enter(self, key):
+        levels = self._levels()
+        depth = len(self._vpath)
+        if depth >= len(levels):
+            return
+        self._vstack.append(self._sel)
+        self._vpath.append((levels[depth], key))
+        self._v_show(None)
+
+    def _v_top(self):
+        self._vpath, self._vstack, self._album_path = [], [], None
+        self._v_show(None)
+
+    def _album_open(self, path):
+        self._album_back = self._sel
+        self._album_path = path
+        self._places_build()
+        self._load(path)
+
+    def _v_play(self, key, shuffle):
+        """Play / shuffle every album in this list (or in the highlighted
+        Artist / Genre / Year), track names from the index."""
+        if self._plv is not None:
+            if self._plv["open"]:
+                self._pl_play(self._plv["open"], shuffle)
+            elif self._items:
+                self._pl_play(self._items[self._sel][1], shuffle)
+            return
+        lib = self._lib
+        if lib is None or self._busy:
+            return
+        if self._search is not None:
+            self._s_play(shuffle)
+            return
+        vp = list(self._vpath)
+        label = self._v_title()
+        if key is not None:
+            levels = self._levels()
+            if len(vp) < len(levels):
+                vp.append((levels[len(vp)], key))
+                label = lib.name(levels[len(vp) - 1], key)
+        albums = [lib.albums[i] for i in lib.sorted_albums(lib.select(vp), self._sort)]
+        root = self._root
+        self._busy = True
+        self["status"].setText("Finding the music in '%s'..." % label)
+
+        def work():
+            try:
+                tracks = _mi.album_tracks(root, albums, MAX_TRACKS)
+            except Exception as e:
+                _log("index gather: %s" % e)
+                tracks = []
+            self._job = ("gather", tracks, shuffle, label)
+        threading.Thread(target=work, name="E2iPTV-Music-Gather", daemon=True).start()
+
+    # -- Search ---------------------------------------------------------------
+
+    def _search_open(self):
+        """Red, or Search in the left panel: needs the music index."""
+        if not self._root or self._busy:
+            return
+        if self._lib is not None:
+            self._index_check()
+            self._search_menu()
+            return
+        self._busy = True
+        self["status"].setText("Opening the music index...")
+        root, layout = self._root, self._layout
+
+        def work():
+            try:
+                data = _mi.load_index(root, layout)
+            except Exception as e:
+                _log("index load: %s" % e)
+                data = None
+            self._job = ("sindex", data)
+        threading.Thread(target=work, name="E2iPTV-Music-IndexLoad", daemon=True).start()
+
+    def _search_index_loaded(self, data):
+        self._show_status()
+        if data is None:
+            if not _mi.indexer.busy:
+                _mi.indexer.start(self._root, self._layout)
+            self._say("Building the music index first - Search works once it's done")
+            return
+        self._lib = _mi.Library(data)
+        self._index_check()
+        self._search_menu()
+
+    def _crit_text(self, field):
+        c, lib = self._crit, self._lib
+        if field in ("artist", "genre"):
+            keys = c.get(field) or []
+            if not keys:
+                return "Any"
+            names = [lib.name(field, k) for k in keys] if lib else keys
+            text = ", ".join(names[:2])
+            return text + (" +%d" % (len(names) - 2) if len(names) > 2 else "")
+        if field == "year":
+            y1, y2 = c.get("y1"), c.get("y2")
+            if not y1 and not y2:
+                return "Any"
+            if y1 == y2:
+                return y1
+            return "%s \u2013 %s" % (y1 or "...", y2 or "...")
+        return c.get(field) or "Any"
+
+    def _search_menu(self):
+        from .side_menu import SideMenu
+        opts = [("Search everything", "any", self._crit_text("any")),
+                ("Artist", "artist", self._crit_text("artist")),
+                ("Genre", "genre", self._crit_text("genre")),
+                ("Year", "year", self._crit_text("year")),
+                ("Album name", "album", self._crit_text("album")),
+                ("Track name", "track", self._crit_text("track")),
+                ("Search now", "go", ""),
+                ("Clear all", "clear", "")]
+        self.session.openWithCallback(
+            self._search_chosen, SideMenu, "Search music", opts,
+            "Filled rows must all match  \u00b7  a comma means 'or'",
+            current=self._s_menu_pos, value_only=True)
+
+    def _search_chosen(self, choice):
+        keys = ["any", "artist", "genre", "year", "album", "track", "go", "clear"]
+        if choice not in keys:
+            return                                # Exit: menu closed
+        self._s_menu_pos = keys.index(choice)
+        if choice in ("any", "album", "track"):
+            from Screens.VirtualKeyBoard import VirtualKeyBoard
+            title = {"any": "Search everything (artist, genre, year, album, track)",
+                     "album": "Album name contains (a comma means 'or')",
+                     "track": "Track name contains (a comma means 'or')"}[choice]
+            self.session.openWithCallback(
+                lambda text, f=choice: self._typed(f, text),
+                VirtualKeyBoard, title=title, text=self._crit.get(choice) or "")
+        elif choice in ("artist", "genre"):
+            from Screens.VirtualKeyBoard import VirtualKeyBoard
+            what = "Artist" if choice == "artist" else "Genre"
+            self.session.openWithCallback(
+                lambda text, f=choice: self._pick_filter(f, text),
+                VirtualKeyBoard,
+                title="%s name contains (leave empty for all)" % what, text="")
+        elif choice == "year":
+            self._pick_year_from()
+        elif choice == "clear":
+            self._crit = dict(_SEARCH_CRIT)
+            self._crit["artist"], self._crit["genre"] = [], []
+            self._s_menu_pos = 0
+            self._search_menu()
+        elif choice == "go":
+            self._search_run()
+
+    def _typed(self, field, text):
+        if text is not None:
+            self._crit[field] = " ".join(text.split())
+        self._search_menu()
+
+    # Artist / Genre: type part of a name, then tick the ones wanted
+    def _pick_filter(self, field, text):
+        if text is None:
+            self._search_menu()
+            return
+        lib = self._lib
+        want = _mi.norm(text)
+        counts = {}
+        for k in lib.keys:
+            key = k[field]
+            if key and (not want or want in key):
+                counts[key] = counts.get(key, 0) + 1
+        keys = sorted(counts, key=lambda k: _mi._natural_key(_mi.norm(lib.name(field, k))))
+        # ones already ticked stay in the list even if they don't match
+        for k in self._crit.get(field) or []:
+            if k not in counts:
+                keys.insert(0, k)
+                counts[k] = 0
+        self._pick_list = (field, keys[:400], counts, len(keys) > 400)
+        self._pick_show(0)
+
+    def _pick_show(self, pos):
+        from .side_menu import SideMenu
+        field, keys, counts, cut = self._pick_list
+        lib = self._lib
+        chosen = set(self._crit.get(field) or [])
+        what = "Artists" if field == "artist" else "Genres"
+        opts = [("Done", "_done", "%d ticked" % len(chosen))]
+        for k in keys:
+            opts.append((("\u2713  " if k in chosen else "     ") + lib.name(field, k), k,
+                         "%d album%s" % (counts[k], "" if counts[k] == 1 else "s")
+                         if counts[k] else ""))
+        if chosen:
+            opts.append(("Untick all", "_none", ""))
+        detail = "OK ticks / unticks"
+        if not keys:
+            detail = "Nothing matches - try fewer letters"
+        elif cut:
+            detail = "First 400 shown - type more letters to narrow it"
+        self.session.openWithCallback(
+            lambda v, p=pos: self._pick_chosen(v), SideMenu, what, opts, detail,
+            current=pos, value_only=True)
+
+    def _pick_chosen(self, value):
+        field, keys, counts, cut = self._pick_list
+        if value is None or value == "_done":
+            self._search_menu()
+            return
+        cur = list(self._crit.get(field) or [])
+        if value == "_none":
+            self._crit[field] = []
+            self._pick_show(0)
+            return
+        if value in cur:
+            cur.remove(value)
+        else:
+            cur.append(value)
+        self._crit[field] = cur
+        self._pick_show(keys.index(value) + 1 if value in keys else 0)
+
+    # Year: from / to, from the years in the collection
+    def _years(self):
+        return sorted(k for k in self._lib.names["year"] if k)
+
+    def _pick_year_from(self):
+        from .side_menu import SideMenu
+        years = self._years()
+        opts = [("Any year", "_any", "")] + [(y, y, "") for y in years]
+        cur = self._crit.get("y1")
+        pos = years.index(cur) + 1 if cur in years else 0
+        self.session.openWithCallback(self._year_from_chosen, SideMenu,
+                                      "Year from", opts, "The first year to include",
+                                      current=pos, value_only=True)
+
+    def _year_from_chosen(self, value):
+        if value is None:
+            self._search_menu()
+            return
+        if value == "_any":
+            self._crit["y1"] = self._crit["y2"] = ""
+            self._search_menu()
+            return
+        self._crit["y1"] = value
+        from .side_menu import SideMenu
+        years = [y for y in self._years() if y >= value]
+        opts = [("Just %s" % value, value, "")] + [(y, y, "") for y in years if y != value] \
+            + [("Any later year", "_open", "")]
+        cur = self._crit.get("y2")
+        pos = next((i for i, o in enumerate(opts) if o[1] == cur), 0)
+        self.session.openWithCallback(self._year_to_chosen, SideMenu,
+                                      "Year to", opts, "The last year to include",
+                                      current=pos, value_only=True)
+
+    def _year_to_chosen(self, value):
+        if value is not None:
+            self._crit["y2"] = "" if value == "_open" else value
+        self._search_menu()
+
+    # Running it and showing the results
+    def _search_summary(self):
+        bits = []
+        for f in ("any", "artist", "genre", "year", "album", "track"):
+            t = self._crit_text(f)
+            if t != "Any":
+                bits.append(t)
+        return "  \u00b7  ".join(bits)
+
+    def _search_run(self):
+        if not _mi.criteria_used(self._crit):
+            self._say("Fill in at least one row to search")
+            self._search_menu()
+            return
+        if self._busy:
+            return
+        lib, root, crit, sort = self._lib, self._root, dict(self._crit), self._sort
+        self._busy = True
+        self["status"].setText("Searching...")
+        t0 = time.time()
+
+        def work():
+            try:
+                res = _mi.search(lib, root, crit, sort)
+            except Exception as e:
+                _log("search: %s" % e)
+                res = ([], [], False)
+            _log("search %s: %d albums, %d tracks in %.1f s" % (
+                self._search_summary(), len(res[0]), len(res[1]), time.time() - t0))
+            self._job = ("search", res, self._search_summary())
+        threading.Thread(target=work, name="E2iPTV-Music-Search", daemon=True).start()
+
+    def _search_done(self, res, label):
+        albums, tracks, more = res
+        if self._search is None:
+            # remember where we were, to come back to on Exit
+            self._s_back = (list(self._vpath), list(self._vstack), self._sel,
+                            self._path, self._album_path)
+        self._search = {"albums": albums, "tracks": tracks, "more": more,
+                        "label": label}
+        self._album_path = None
+        self._focus = "files"
+        self._s_show(None)
+        if not albums and not tracks:
+            self._say("Nothing found for: %s" % label)
+        else:
+            self._notice = ""
+            self._show_status()
+
+    def _s_count_text(self):
+        sr = self._search
+        na, nt = len(sr["albums"]), len(sr["tracks"])
+        bits = []
+        if na:
+            bits.append("%d album%s" % (na, "" if na == 1 else "s"))
+        if nt:
+            bits.append("%s%d track%s" % ("first " if sr["more"] else "", nt,
+                                          "" if nt == 1 else "s"))
+        return "   \u00b7   ".join(bits) or "Nothing found"
+
+    def _s_show(self, sel=None):
+        sr, lib = self._search, self._lib
+        items, notes = [], []
+        for i in sr["albums"]:
+            a = lib.albums[i]
+            items.append((a[_mi.A_ALBUM], os.path.join(self._root, a[_mi.A_REL]), "album"))
+            notes.append("  \u00b7  ".join(b for b in (
+                a[_mi.A_ARTIST], a[_mi.A_YEAR],
+                lib.name("genre", lib.keys[i]["genre"]) if a[_mi.A_GENRE] else "") if b))
+        for path, title, i in sr["tracks"]:
+            a = lib.albums[i]
+            items.append((title, path, False))
+            notes.append("%s  \u00b7  %s" % (a[_mi.A_ARTIST], a[_mi.A_ALBUM]))
+        self._items, self._item_notes = items, notes
+        self._sel = sel if (sel is not None and 0 <= sel < len(items)) else 0
+        self._scroll = 0
+        self["header"].setText("Music  \u203a  Search:  %s   (%s)" % (
+            sr["label"], self._s_count_text()))
+        self._places_build()
+        self._paint()
+
+    def _s_play(self, shuffle):
+        sr = self._search
+        tracks = [t[0] for t in sr["tracks"]]
+        albums = [self._lib.albums[i] for i in sr["albums"]]
+        root = self._root
+        self._busy = True
+        self["status"].setText("Finding the music in the search results...")
+
+        def work():
+            out = list(tracks)
+            try:
+                if albums:
+                    out = _mi.album_tracks(root, albums, MAX_TRACKS) + out
+            except Exception as e:
+                _log("search gather: %s" % e)
+            self._job = ("gather", out[:MAX_TRACKS], shuffle, "search results")
+        threading.Thread(target=work, name="E2iPTV-Music-Gather", daemon=True).start()
+
+    def _search_leave(self):
+        """Exit from the results: back to where Search was started."""
+        self._search = None
+        back, self._s_back = self._s_back, None
+        self._go_back(back)
+
+    def _here(self):
+        """Where we are now, to come back to (see _go_back)."""
+        return (list(self._vpath), list(self._vstack), self._sel,
+                self._path, self._album_path)
+
+    def _go_back(self, back):
+        self._notice = ""
+        if back is None:
+            back = ([], [], 0, self._root, None)
+        vpath, vstack, sel, path, album_path = back
+        if self._mode != "folders" and self._lib is not None:
+            if album_path:
+                self._vpath, self._vstack = vpath, vstack
+                self._album_path = album_path
+                self._load(path)
+            else:
+                self._vpath, self._vstack = vpath, vstack
+                self._v_show(sel)
+        else:
+            self._album_path = None
+            self._load(path or self._root)
+
+    # -- Playlists ------------------------------------------------------------
+
+    def _plv_open(self):
+        """The list of playlists, in the right panel."""
+        if self._busy:
+            return
+        if self._plv is None:
+            if self._search is not None:
+                back = self._s_back             # back to before the search
+                self._search, self._s_back = None, None
+            else:
+                back = self._here()
+            self._plv = {"open": None, "back": back, "sel": 0}
+        else:
+            self._plv["open"] = None
+        self._album_path = None
+        self._plv_show(self._plv.get("sel"))
+
+    def _plv_show(self, sel=None):
+        pv = self._plv
+        if pv is None:
+            return                     # left the playlists meanwhile
+        items, notes = [], []
+        if pv["open"] is None:
+            for name, n in _pls.counts():
+                items.append((name, name, "plist"))
+                notes.append("%d track%s" % (n, "" if n == 1 else "s"))
+            self["header"].setText("Music  \u203a  Playlists")
+        else:
+            for path in _pls.tracks(self._root, pv["open"]):
+                items.append((track_name(path), path, False))
+                notes.append(self._track_note(path))
+            self["header"].setText("Music  \u203a  Playlists  \u203a  %s" % pv["open"])
+        self._items, self._item_notes = items, notes
+        self._sel = sel if (sel is not None and 0 <= sel < len(items)) else 0
+        self._scroll = 0
+        self._places_build()
+        self._paint()
+        if not items:
+            self._say("No playlists yet - press Menu on a track, album or artist "
+                      "to add it to one" if pv["open"] is None
+                      else "This playlist is empty")
+        else:
+            self._notice = ""
+            self._show_status()
+
+    def _plv_up(self):
+        pv = self._plv
+        if pv["open"] is not None:
+            pv["open"] = None
+            self._plv_show(pv.get("sel"))
+            return
+        self._plv = None
+        self._go_back(pv["back"])
+
+    def _track_note(self, path):
+        """'Artist  ·  Album' from where the track is in the music folder."""
+        root = self._root.rstrip("/") + "/"
+        if not path.startswith(root):
+            return os.path.dirname(path)
+        parts = path[len(root):].split("/")
+        levels = {"agal": 3, "gaal": 3, "aal": 2}.get(self._layout, 3)
+        if len(parts) <= levels:
+            return ""
+        artist = parts[1] if self._layout == "gaal" else parts[0]
+        album = _mi.split_album(parts[levels - 1])[1]
+        return "%s  \u00b7  %s" % (artist, album)
+
+    def _pl_play(self, name, shuffle):
+        tracks = _pls.tracks(self._root, name)
+        if not tracks:
+            self._say("This playlist is empty")
+            return
+        self._job = ("gather", tracks, shuffle, name)
+
+    # Menu: the options for the highlighted entry
+    def _item_menu(self):
+        from .side_menu import SideMenu
+        if self._busy or self._focus != "files":
+            return
+        it = self._items[self._sel] if self._items else None
+        pv = self._plv
+        opts = []
+        if pv is not None and pv["open"] and it is not None:
+            opts = [("Remove from this playlist", "rm"), ("Move up", "up"),
+                    ("Move down", "down"), ("Add to another playlist", "add")]
+        elif pv is not None:
+            if it is not None:
+                opts = [("Play", "play"), ("Shuffle", "shuffle"),
+                        ("Rename", "rename"), ("Delete this playlist", "del")]
+        else:
+            if it is not None and it[2] != "up":
+                what = {"group": "all of %s" % it[0], "album": "this album",
+                        True: "this folder", False: "this track"}.get(it[2], "this")
+                opts.append(("Add %s to a playlist" % what, "add"))
+            if any(i[2] != "up" for i in self._items) or self._search is not None:
+                opts.append(("Add the whole list to a playlist", "addall"))
+            opts.append(("Open my playlists", "lists"))
+            if it is not None and it[2] is False:
+                opts.insert(0, ("Play", "playtrack"))
+                opts.append(("Delete this track", "deltrack"))
+        if not opts:
+            return
+        self.session.openWithCallback(
+            self._item_chosen, SideMenu, "Music options", opts,
+            it[0] if it is not None else "", value_only=True)
+
+    def _item_chosen(self, choice):
+        it = self._items[self._sel] if self._items else None
+        pv = self._plv
+        if choice == "add" and it is not None:
+            self._pl_target = ("item", it)
+            self._pl_pick()
+        elif choice == "addall":
+            self._pl_target = ("all", None)
+            self._pl_pick()
+        elif choice == "lists":
+            self._plv_open()
+        elif choice == "playtrack" and it is not None:
+            self._on_ok()
+        elif choice == "deltrack" and it is not None and it[2] is False:
+            from .side_menu import SideMenu
+            self.session.openWithCallback(
+                lambda v, path=it[1]: self._delete_track(path, v), SideMenu,
+                "Delete '%s'?" % it[0],
+                [("No, keep it", "no"), ("Yes, delete it", "yes")],
+                "It goes into the '%s' folder in your music folder - "
+                "empty that yourself when you're sure" % DELETED_DIR,
+                value_only=True)
+        elif choice == "rm" and pv and pv["open"]:
+            _pls.remove_track(pv["open"], self._sel)
+            self._plv_show(self._sel)
+        elif choice in ("up", "down") and pv and pv["open"]:
+            j = _pls.move_track(pv["open"], self._sel, -1 if choice == "up" else 1)
+            self._plv_show(j)
+        elif choice in ("play", "shuffle") and it is not None:
+            self._pl_play(it[1], choice == "shuffle")
+        elif choice == "rename" and it is not None:
+            from Screens.VirtualKeyBoard import VirtualKeyBoard
+            self.session.openWithCallback(
+                lambda new, old=it[1]: self._pl_renamed(old, new),
+                VirtualKeyBoard, title="New name for the playlist", text=it[1])
+        elif choice == "del" and it is not None:
+            from .side_menu import SideMenu
+            self.session.openWithCallback(
+                lambda v, name=it[1]: self._pl_delete(name, v), SideMenu,
+                "Delete '%s'?" % it[1],
+                [("No, keep it", "no"), ("Yes, delete it", "yes")],
+                "Only the playlist goes - the music stays", value_only=True)
+
+    def _delete_track(self, path, answer):
+        """Move the track into <music folder>/Deleted (keeping where it
+        was, so nothing clashes), and take it out of the lists."""
+        if answer != "yes":
+            return
+        root = self._root.rstrip("/")
+        if path.startswith(root + "/"):
+            rel = path[len(root) + 1:]
+        else:
+            rel = os.path.basename(path)
+        dst = os.path.join(root, DELETED_DIR, rel)
+        base, ext = os.path.splitext(dst)
+        n = 2
+        while os.path.exists(dst):
+            dst = "%s (%d)%s" % (base, n, ext)
+            n += 1
+        # Not while it's playing
+        if queue.active and queue.current() == path:
+            if queue.index + 1 < len(queue.tracks):
+                queue.next()
+            else:
+                queue.stop()
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            try:
+                os.rename(path, dst)
+            except OSError:
+                import shutil
+                shutil.move(path, dst)
+        except Exception as e:
+            _log("delete %s: %s" % (path, e))
+            self._say("Couldn't delete it: %s" % e)
+            return
+        _log("deleted (moved to %s): %s" % (DELETED_DIR, path))
+        # Out of the queue, the playlists and this list
+        if path in queue.tracks:
+            i = queue.tracks.index(path)
+            if i != queue.index:
+                del queue.tracks[i]
+                if i < queue.index:
+                    queue.index -= 1
+        try:
+            _pls.remove_path(self._root, path)
+        except Exception as e:
+            _log("delete: playlists: %s" % e)
+        for i, item in enumerate(self._items):
+            if item[1] == path:
+                del self._items[i]
+                if i < len(self._item_notes):
+                    del self._item_notes[i]
+                break
+        if self._search is not None:
+            self._search["tracks"] = [t for t in self._search["tracks"] if t[0] != path]
+        self._sel = max(0, min(self._sel, len(self._items) - 1))
+        self._paint()
+        self._say("Deleted '%s'  (in the %s folder)" % (track_name(path), DELETED_DIR))
+
+    def _pl_renamed(self, old, new):
+        new = " ".join((new or "").split())
+        if new and new != old:
+            if not _pls.rename(old, new):
+                self._say("There's already a playlist called '%s'" % new)
+        self._plv_show(self._sel)
+
+    def _pl_delete(self, name, answer):
+        if answer == "yes":
+            _pls.delete(name)
+            self._say("Deleted the playlist '%s'" % name)
+        self._plv_show(max(0, self._sel - 1) if answer == "yes" else self._sel)
+
+    def _pl_pick(self):
+        from .side_menu import SideMenu
+        opts = [("New playlist...", "_new", "")] + [
+            (n, n, "%d track%s" % (c, "" if c == 1 else "s")) for n, c in _pls.counts()
+            if not (self._plv and self._plv["open"] == n)]
+        self.session.openWithCallback(self._pl_picked, SideMenu,
+                                      "Add to playlist", opts, value_only=True)
+
+    def _pl_picked(self, name):
+        if not name:
+            return
+        if name == "_new":
+            from Screens.VirtualKeyBoard import VirtualKeyBoard
+            self.session.openWithCallback(self._pl_named, VirtualKeyBoard,
+                                          title="Name for the new playlist", text="")
+            return
+        self._pl_add(name)
+
+    def _pl_named(self, name):
+        name = " ".join((name or "").split())
+        if name:
+            self._pl_add(name)
+
+    def _pl_add(self, name):
+        """Find the tracks for what was chosen (in the background), then
+        add them (_pl_added)."""
+        if self._busy:
+            return
+        kind, it = self._pl_target or ("all", None)
+        lib, root = self._lib, self._root
+        albums, tracks, folder = [], [], None
+        if kind == "item":
+            label, path, is_dir = it
+            if is_dir is False:
+                tracks = [path]
+            elif is_dir == "group" and lib is not None:
+                vp = list(self._vpath)
+                levels = self._levels()
+                if len(vp) < len(levels):
+                    vp.append((levels[len(vp)], path))
+                albums = [lib.albums[i] for i in lib.sorted_albums(lib.select(vp), self._sort)]
+            elif is_dir in ("album", True):
+                folder = path
+        else:
+            if self._plv is not None and self._plv["open"]:
+                tracks = [i[1] for i in self._items if i[2] is False]
+            elif self._search is not None:
+                tracks = [t[0] for t in self._search["tracks"]]
+                albums = [lib.albums[i] for i in self._search["albums"]]
+            elif self._virtual() and lib is not None:
+                idx = lib.select(self._vpath)
+                albums = [lib.albums[i] for i in lib.sorted_albums(idx, self._sort)]
+            else:
+                folder = self._path
+        self._busy = True
+        self["status"].setText("Adding to '%s'..." % name)
+
+        def work():
+            out = []
+            try:
+                if albums:
+                    out += _mi.album_tracks(root, albums, MAX_TRACKS)
+                if folder:
+                    out += gather_tracks(folder)
+                out += tracks
+            except Exception as e:
+                _log("playlist gather: %s" % e)
+            self._job = ("pladd", name, out[:MAX_TRACKS])
+        threading.Thread(target=work, name="E2iPTV-Music-PlAdd", daemon=True).start()
+
+    def _pl_added(self, name, paths):
+        if not paths:
+            self._say("No music found to add")
+            return
+        try:
+            n = _pls.add(self._root, name, paths)
+        except Exception as e:
+            _log("playlist add: %s" % e)
+            self._say("Couldn't save the playlist: %s" % e)
+            return
+        skipped = len(paths) - n
+        _log("playlist '%s': added %d tracks" % (name, n))
+        self._say("Added %d track%s to '%s'%s" % (
+            n, "" if n == 1 else "s", name,
+            ("  (%d already in it)" % skipped) if skipped else ""))
+        if self._plv is not None:
+            self._plv_show(self._sel)
+
+    # -- Browse, sort and rescan (the menu) -----------------------------------
+
+    def _library_menu(self):
+        from .side_menu import SideMenu
+        ix = _mi.indexer
+        if ix.busy:
+            detail = "%s the index: %d albums so far" % (
+                "Building" if ix.kind == "build" else "Checking", ix.albums_seen)
+        elif self._lib is not None:
+            detail = "%d albums  \u00b7  %d tracks" % (len(self._lib.albums), self._lib.tracks)
+        else:
+            detail = "Music index not built yet"
+        opts = [("Browse by", "mode", _mi.MODE_NAMES[self._mode]),
+                ("Sort albums", "sort", _mi.SORT_NAMES[self._sort]),
+                ("Folder layout", "layout", _mi.LAYOUT_NAMES[self._layout]),
+                ("Rescan music now", "rescan", "")]
+        self.session.openWithCallback(self._library_chosen, SideMenu,
+                                      "Music library", opts, detail, value_only=True)
+
+    def _pick(self, title, choices, cur, callback):
+        from .side_menu import SideMenu
+        keys = [k for k, _n in choices]
+        self.session.openWithCallback(
+            callback, SideMenu, title,
+            [(("\u2713  " if k == cur else "     ") + n, k) for k, n in choices],
+            current=keys.index(cur) if cur in keys else 0, value_only=True)
+
+    def _library_chosen(self, choice):
+        if choice == "mode":
+            self._pick("Browse by", _mi.MODES, self._mode, self._mode_chosen)
+        elif choice == "sort":
+            self._pick("Sort albums", _mi.SORTS, self._sort, self._sort_chosen)
+        elif choice == "layout":
+            self._pick("Folder layout", _mi.LAYOUTS, self._layout, self._layout_chosen)
+        elif choice == "rescan":
+            if not self._root:
+                return
+            if _mi.indexer.busy:
+                self._say("The music index is already being updated")
+                return
+            _mi.indexer.start(self._root, self._layout, full=True)
+            _log("rescan asked for")
+
+    def _mode_chosen(self, key):
+        if not key or key not in _mi.MODE_NAMES or key == self._mode:
+            return
+        self._mode = key
+        _save_settings(browse=key)
+        self._focus = "files"
+        self._search, self._s_back = None, None
+        self._plv = None
+        self._vpath, self._vstack, self._album_path = [], [], None
+        if key == "folders":
+            self._notice = ""
+            self._load(self._root or self._path)
+        else:
+            self._index_open()
+
+    def _sort_chosen(self, key):
+        if not key or key not in _mi.SORT_NAMES:
+            return
+        self._sort = key
+        _save_settings(sort=key)
+        if self._virtual() and self._lib is not None:
+            self._v_refresh()
+
+    def _layout_chosen(self, key):
+        if not key or key not in _mi.LAYOUT_NAMES or key == self._layout:
+            return
+        self._layout = key
+        _save_settings(layout=key)
+        self._lib = None
+        self._search, self._s_back = None, None
+        self._plv = None
+        self._vpath, self._vstack, self._album_path = [], [], None
+        if self._mode != "folders" and self._root:
+            if not _mi.indexer.busy:
+                _mi.indexer.start(self._root, key, full=True)
+            self._items, self._item_notes = [], []
+            self._paint()
+            self._say("Rebuilding the music index for the new layout...")
+
     # -- the rail -----------------------------------------------------------
 
     def _handle_child_close(self, result=None):
@@ -1826,6 +3140,30 @@ class MusicBrowser(_MediaKeys, Screen):
         self._timer.stop()
         self._keys_unbind()
         queue.leave()
+        self._remember_place()
+
+    def _remember_place(self):
+        """Where Music was, to open there next time: the Browse by place
+        (or folder) and the highlighted entry. In Search or Playlists,
+        the place they were opened from."""
+        try:
+            if self._plv is not None:
+                back = self._plv.get("back")
+            elif self._search is not None:
+                back = self._s_back
+            else:
+                back = None
+            if back is not None:
+                vpath, _vs, sel, path, album = back
+                item = None
+            else:
+                vpath, path, album = self._vpath, self._path, self._album_path
+                item = self._items[self._sel][0] if self._items else None
+            _save_settings(place={"mode": self._mode,
+                                  "vpath": [list(v) for v in vpath],
+                                  "album": album, "path": path, "item": item})
+        except Exception as e:
+            _log("remember place: %s" % e)
 
     def get_mirror_b2(self):
         return [(n, None, False) for n, _p, _d in self._items], self._sel
